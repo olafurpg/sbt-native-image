@@ -58,20 +58,28 @@ object NativeImagePlugin extends AutoPlugin {
       taskKey[Seq[String]](
         "Extra command-line arguments that should be forwarded to the native-image optimizer."
       )
+    lazy val nativeImageSubstitutions: TaskKey[Seq[File]] =
+      taskKey[Seq[File]]("Class substitutions for native-image.")
+
+    object nativeImageDefaults {
+      def version = "20.1.0"
+      def jvm = "graalvm-java11"
+    }
   }
   import autoImport._
 
   private def copyResource(
       filename: String,
-      outDir: File
+      outDir: File,
+      toFix: String =
+        "To fix this problem, define the `nativeImageCoursier` task to return the path to a Coursier binary."
   ): File = {
     Files.createDirectories(outDir.toPath)
-    val in =
-      this.getClass().getResourceAsStream(s"/sbt-native-image/${filename}")
+    val path = s"/sbt-native-image/${filename}"
+    val in = this.getClass().getResourceAsStream(path)
     if (in == null) {
       throw new MessageOnlyException(
-        "unable to find coursier binary via resources. " +
-          "To fix this problem, define the `nativeImageCoursier` task to return the path to a Coursier binary."
+        s"unable to find file '$path' binary via resources. $toFix"
       )
     }
     val out = outDir.toPath.resolve(filename)
@@ -80,10 +88,6 @@ object NativeImagePlugin extends AutoPlugin {
     out.toFile
   }
   override lazy val projectSettings: Seq[Def.Setting[_]] = List(
-    libraryDependencies ++= {
-      if (scalaVersion.value.startsWith("2.11")) Nil
-      else List("org.scalameta" %% "svm-subs" % nativeImageVersion.value)
-    },
     target.in(NativeImage) :=
       target.in(Compile).value / "native-image",
     target.in(NativeImageInternal) :=
@@ -94,11 +98,19 @@ object NativeImagePlugin extends AutoPlugin {
       { () => this.alertUser(s, "Native image ready!") }
     },
     mainClass.in(NativeImage) := mainClass.in(Compile).value,
-    nativeImageJvm := "graalvm-java11",
-    nativeImageVersion := "20.1.0",
+    nativeImageJvm := nativeImageDefaults.jvm,
+    nativeImageVersion := nativeImageDefaults.version,
     name.in(NativeImage) := name.value,
     mainClass.in(NativeImage) := mainClass.in(Compile).value,
     nativeImageOptions := List(),
+    nativeImageSubstitutions := {
+      val builtinSubs = copyResource(
+        "native-image-substitutions.jar",
+        target.in(NativeImageInternal).value,
+        "To fix this problem, add the settings `nativeImageSubstitutions := List()`."
+      )
+      List(builtinSubs)
+    },
     nativeImageCoursier := {
       val dir = target.in(NativeImageInternal).value
       val out = copyResource("coursier", dir)
@@ -155,6 +167,9 @@ object NativeImagePlugin extends AutoPlugin {
       )
       println(out.absolutePath)
     },
+    nativeImageSubstitutions := {
+      List()
+    },
     nativeImageRun := {
       val binary = nativeImageOutput.value
       if (!binary.isFile()) {
@@ -169,11 +184,13 @@ object NativeImagePlugin extends AutoPlugin {
       }
     },
     nativeImage := {
-      val __ = checkUpToDateScalaVersion.value
+      // val __ = checkUpToDateScalaVersion.value
       val _ = compile.in(Compile).value
       val main = mainClass.in(NativeImage).value
       val binaryName = nativeImageOutput.value
-      val cp = fullClasspath.in(Compile).value.map(_.data)
+      val userClasspath = fullClasspath.in(Compile).value.map(_.data)
+      val subs = nativeImageSubstitutions.value
+      val nativeClasspath = subs ++ userClasspath
       // NOTE(olafur): we pass in a manifest jar instead of the full classpath
       // for two reasons:
       // * large classpaths quickly hit on the "argument list too large"
@@ -182,16 +199,16 @@ object NativeImagePlugin extends AutoPlugin {
       //   it more readable and easier to copy-paste.
       val manifest = target.in(NativeImageInternal).value / "manifest.jar"
       manifest.getParentFile().mkdirs()
-      createManifestJar(manifest, cp)
-      val nativeClasspath =
-        if (Properties.isWin) cp.mkString(File.pathSeparator)
+      createManifestJar(manifest, nativeClasspath)
+      val manifestClasspath =
+        if (Properties.isWin) nativeClasspath.mkString(File.pathSeparator)
         else manifest.absolutePath
 
       // Assemble native-image argument list.
       val command = mutable.ListBuffer.empty[String]
       command ++= nativeImageCommand.value
       command += "-cp"
-      command += nativeClasspath
+      command += manifestClasspath
       command ++= nativeImageOptions.value
       command += main.getOrElse(
         throw new MessageOnlyException(
